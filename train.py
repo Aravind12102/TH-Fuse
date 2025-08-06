@@ -11,22 +11,32 @@ from torch.optim import Adam
 from os.path import join
 from loss import final_ssim, TV_Loss
 from loss_p import VggDeep,VggShallow
+from torch.cuda.amp import autocast, GradScaler  # ADD THIS
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-def train(image_lists):
 
+def train(image_lists):
+    print('Setting up training...')
+    
     image_mode = 'L'
     fusemodel = Fusenet() 
     vgg_ir_model = VggDeep() 
     vgg_vi_model = VggShallow()
 
-    mse_loss = torch.nn.MSELoss() 
-    TVLoss = TV_Loss() 
+    # Only keep L1_loss since MSE and TV are unused
     L1_loss = nn.L1Loss() 
 
     fusemodel.cuda()
     vgg_ir_model.cuda()
     vgg_vi_model.cuda()
+
+    # OPTIMIZATION 1: Mixed Precision Setup
+    scaler = GradScaler()
+    
+    # OPTIMIZATION 2: Move optimizer creation outside loops
+    optimizer_model = Adam(fusemodel.parameters(), args.learning_rate)
+    optimizer_vgg_ir = Adam(vgg_ir_model.parameters(), args.learning_rate_d)
+    optimizer_vgg_vi = Adam(vgg_vi_model.parameters(), args.learning_rate_d)
 
     tbar = trange(args.epochs, ncols=150)
     print('Start training.....')
@@ -46,6 +56,7 @@ def train(image_lists):
         image_set, batches = dataset.load_dataset(image_lists, args.batch_size)
         fusemodel.train()
         count = 0
+        
         for batch in range(batches):
             image_paths = image_set[batch * args.batch_size:(batch * args.batch_size + args.batch_size)]
             dir1 = "/content/visible-infrared-wildfire-experiment/m300_grabbed_data_1_51.2/m300_grabbed_data_1_51.2/rgb" 
@@ -62,66 +73,48 @@ def train(image_lists):
 
             count += 1
 
-            optimizer_model = Adam(fusemodel.parameters(), args.learning_rate)
+            # OPTIMIZATION 3: Only zero_grad, don't recreate optimizers
             optimizer_model.zero_grad()
-
-            optimizer_vgg_ir = Adam(vgg_ir_model.parameters(), args.learning_rate_d)
             optimizer_vgg_ir.zero_grad()
-
-            optimizer_vgg_vi = Adam(vgg_vi_model.parameters(), args.learning_rate_d)
             optimizer_vgg_vi.zero_grad()
 
             img_vi = img_vi.cuda()
             img_ir = img_ir.cuda()
 
-            outputs = fusemodel(img_vi, img_ir)
+            # OPTIMIZATION 4: Mixed precision forward pass
+            with autocast():
+                outputs = fusemodel(img_vi, img_ir)
+                
+                # OPTIMIZATION 5: Remove all unused computations
+                ssim_loss_value = 1 - final_ssim(img_ir, img_vi, outputs)
+                model_loss = ssim_loss_value  # Only SSIM loss since MSE and TV are set to 0
 
-            ssim_loss_value = 0
-            mse_loss_value = 0
-            TV_loss_value = 0
+            # OPTIMIZATION 6: Mixed precision backward pass
+            scaler.scale(model_loss).backward()
+            scaler.step(optimizer_model)
+            scaler.update()
 
-            ssim_loss_temp = 1 - final_ssim(img_ir, img_vi, outputs)
-            mse_loss_temp = mse_loss(img_ir,outputs) + mse_loss(img_vi,outputs)
-            TVLoss_temp = TVLoss(img_ir,outputs)+TVLoss(img_vi,outputs)
-            mse_loss_temp = 0
-            TVLoss_temp = 0
+            # VGG IR feature loss (with mixed precision)
+            with autocast():
+                vgg_ir_fuse_out = vgg_ir_model(outputs.detach())[2]
+                vgg_ir_out = vgg_ir_model(img_ir)[2]
+                per_loss_ir_value = L1_loss(vgg_ir_fuse_out, vgg_ir_out)
+            
+            scaler.scale(per_loss_ir_value).backward()
+            scaler.step(optimizer_vgg_ir)
+            scaler.update()
 
-            ssim_loss_value += ssim_loss_temp
-            mse_loss_value += mse_loss_temp
-            TV_loss_value +=TVLoss_temp
+            # VGG VI feature loss (with mixed precision)
+            with autocast():
+                vgg_vi_fuse_out = vgg_vi_model(outputs.detach())[0]
+                vgg_vi_out = vgg_vi_model(img_vi)[0]
+                per_loss_vi_value = L1_loss(vgg_vi_fuse_out, vgg_vi_out)
+            
+            scaler.scale(per_loss_vi_value).backward()
+            scaler.step(optimizer_vgg_vi)
+            scaler.update()
 
-            ssim_loss_value /= len(outputs)
-            mse_loss_value /= len(outputs)
-            TV_loss_value /= len(outputs)
-
-            model_loss = ssim_loss_value + 0.05 * mse_loss_value + 0.05 *  TV_loss_value
-            model_loss.backward() 
-            optimizer_model.step() 
-
-        
-            vgg_ir_fuse_out = vgg_ir_model(outputs.detach())[2]
-            vgg_ir_out = vgg_ir_model(img_ir)[2]
-            per_loss_ir = L1_loss(vgg_ir_fuse_out, vgg_ir_out)
-            per_loss_ir_value = 0
-            per_loss_ir_temp = per_loss_ir
-            per_loss_ir_value += per_loss_ir_temp
-            per_loss_ir_value /= len(outputs)
-            per_loss_ir_value.backward()
-            optimizer_vgg_ir.step()
-        
-
-        
-            vgg_vi_fuse_out = vgg_vi_model(outputs.detach())[0]
-            vgg_vi_out = vgg_vi_model(img_vi)[0]
-            per_loss_vi = L1_loss(vgg_vi_fuse_out, vgg_vi_out)
-            per_loss_vi_value = 0
-            per_loss_vi_temp = per_loss_vi
-            per_loss_vi_value += per_loss_vi_temp
-            per_loss_vi_value /= len(outputs)
-            per_loss_vi_value.backward()
-            optimizer_vgg_vi.step()
-       
-
+            # Accumulate losses for logging
             all_ssim_loss += ssim_loss_value.item()
             all_model_loss = all_ssim_loss
             all_ir_feature_loss += per_loss_ir_value.item()
@@ -139,6 +132,8 @@ def train(image_lists):
 
                 save_num += 1
                 all_ssim_loss = 0.
+                all_ir_feature_loss = 0.
+                all_vi_feature_loss = 0.
                 
             if (batch + 1) % (args.train_num//args.batch_size) == 0:
                 fusemodel.eval()
@@ -148,17 +143,29 @@ def train(image_lists):
                 torch.save(fusemodel.state_dict(), save_model_path)
                 fusemodel.train()
                 fusemodel.cuda()
+                print(f"Model saved: {save_model_filename}")
                 
     fusemodel.eval()
     fusemodel.cpu()
     save_model_filename = "Final_epoch_" + str(args.epochs) + ".model"
     save_model_path = os.path.join(args.save_model_path, save_model_filename)
     torch.save(fusemodel.state_dict(), save_model_path)
+    print("Training completed!")
 
 def main():
+    # OPTIMIZATION 7: Smart subset selection for Colab
     images_path = utils.list_images(args.dataset_path)
-    train_num = args.train_num 
-    images_path = images_path[:train_num]
+    
+    # For 19GB dataset, use subset for faster experimentation
+    if len(images_path) > 10000:  # Adjust based on your needs
+        print(f"Using subset of {len(images_path)} images for faster training...")
+        train_num = min(args.train_num, 5000)  # Start with 5k images
+        images_path = images_path[:train_num]
+        print(f"Training on {len(images_path)} images")
+    else:
+        train_num = args.train_num 
+        images_path = images_path[:train_num]
+    
     random.shuffle(images_path)
     train(images_path)
 
